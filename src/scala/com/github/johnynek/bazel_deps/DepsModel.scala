@@ -791,56 +791,67 @@ case class Dependencies(toMap: Map[MavenGroup, Map[ArtifactOrProject, ProjectRec
 object Dependencies {
   def empty: Dependencies = Dependencies(Map.empty[MavenGroup, Map[ArtifactOrProject, ProjectRecord]])
 
-  case class Entries(values: List[(ArtifactOrProject, ProjectRecord)]) {
-    private lazy val flattened: Set[(ArtifactOrProject, ProjectRecord)] = values.flatMap {
+  case class Entries(
+    values: List[(ArtifactOrProject, ProjectRecord)],
+    inputs: Set[(ArtifactOrProject, ProjectRecord)]
+  ) {
+    private def flattened: Set[(ArtifactOrProject, ProjectRecord)] = values.flatMap {
       case (a, p) => p.flatten(a)
     }.toSet
 
-    lazy val length: Int = values.length
+    def hasAllInputs: Boolean = flattened == inputs
 
-    def hasAll(inputs: Set[(ArtifactOrProject, ProjectRecord)]): Boolean =
-      flattened == inputs
+    lazy val length: Int = values.length
+    lazy val totalPrefixLength: Int = values.foldLeft(0)((acc, ap) => acc + ap._1.asString.length)
 
     def add(a: ArtifactOrProject, p: ProjectRecord): Entries =
-      Entries((a, p) :: values)
-
-    def normalized: Entries = Entries(values.sorted(Entries.orderEntry))
+      Entries((a, p) :: values, inputs)
   }
 
   object Entries {
-    val empty: Entries = Entries(Nil)
-
-    private implicit def orderList[T: Ordering]: Ordering[List[T]] =
-      Ordering.Iterable[T].on[List[T]](identity)
-
-    private implicit val orderArtifactOrProject: Ordering[ArtifactOrProject] =
-      Ordering.by { a: ArtifactOrProject =>
-        val str = a.asString
-        (-str.size, str)
-      }
-
-    val orderEntry: Ordering[(ArtifactOrProject, ProjectRecord)] =
-      Ordering[(ProjectRecord, ArtifactOrProject)].on(_.swap)
+    def empty(inputs: Set[(ArtifactOrProject, ProjectRecord)]): Entries = Entries(Nil, inputs)
 
     /**
      * Order by descending preference.
      *
      * We prefer shorter entries, and when two entries have the same length, we
-     * next compare the collections lexicographically by length and value of
-     * prefix (first preferring longer prefixes, then the lexicographically
-     * earlier string).
+     * next prefer entries where the sum of the lengths of all the prefixes are
+     * smaller. If these are also the same, falls back to comparing the elements
+     * themselves.
      */
     implicit val orderEntries: Ordering[Entries] = new Ordering[Entries] {
+      private implicit def orderList[T: Ordering]: Ordering[List[T]] =
+        Ordering.Iterable[T].on[List[T]](identity)
+
+      private implicit val orderArtifactOrProject: Ordering[ArtifactOrProject] =
+        Ordering.by { a: ArtifactOrProject =>
+          val str = a.asString
+          (-str.size, str)
+        }
+
       private val sameLength: Ordering[List[(ArtifactOrProject, ProjectRecord)]] =
         Ordering[List[(ArtifactOrProject, ProjectRecord)]]
 
       def compare(as: Entries, bs: Entries): Int = {
         val diff = as.length - bs.length
 
-        if (diff != 0) diff else sameLength.compare(as.values, bs.values)
+        if (diff != 0) diff else {
+          val prefixDiff = bs.totalPrefixLength - as.totalPrefixLength
+
+          if (prefixDiff != 0) prefixDiff else sameLength.compare(as.values, bs.values)
+        }
       }
     }
-  }
+
+    def pickBetter(oa: Option[Entries], ob: Option[Entries]): Option[Entries] =
+      (oa, ob) match {
+        case (None, None) => None
+        case (sa @ Some(a), sb @ Some(b)) =>
+          if (orderEntries.lteq(a, b)) sa else sb
+        case (sa @ Some(_), None) => sa
+        case (None, sb @ Some(_)) => sb
+      }
+    }
 
   /**
    * Combine as many ProjectRecords as possible into a result
@@ -864,72 +875,74 @@ object Dependencies {
 
     // each Artifact-project record pair is either in the final result, or it isn't. We
     // just build all the cases now:
-    def manyWorlds(candidates: CandidateGraph, acc: Entries): List[Entries] = {
-      candidates match {
-        case Nil => List(acc)
-        case (art, Nil) :: tail => manyWorlds(tail, acc)
-        case (art, (_, Nil) :: rest) :: tail => manyWorlds((art, rest) :: tail, acc)
-        case (art, (pr, subs) :: rest) :: tail =>
-          // we consider taking (art, pr) and putting it in the result:
-          val newPR = subs.foldLeft(pr) { case (pr, (sub, _)) => pr.withModule(sub) }.normalizeEmptyModule
+    def manyWorlds(
+      candidates: CandidateGraph,
+      acc: Entries,
+      best: Option[Entries]
+    ): Option[Entries] = {
+      /**
+       * If the current accumulator isn't as optimal as the previous best we've
+       * seen, we bail out, since it's only getting worse.
+       */
+      if (best.exists(Entries.orderEntries.lteq(_, acc))) {
+        None
+      } else {
+        candidates match {
+          case Nil => if (acc.hasAllInputs) Some(acc) else None
+          case (art, Nil) :: tail => manyWorlds(tail, acc, best)
+          case (art, (_, Nil) :: rest) :: tail => manyWorlds((art, rest) :: tail, acc, best)
+          case (art, (pr, subs) :: rest) :: tail =>
+            // we consider taking (art, pr) and putting it in the result:
+            val newPR = subs.foldLeft(pr) { case (pr, (sub, _)) => pr.withModule(sub) }.normalizeEmptyModule
 
-          val finished: Set[AP] = subs.map(_._2).toSet
-          // this ArtifactOrProject has been used, so nothing in rest is legitimate
-          // but we also need to filter to not consider items we have already added
-          val newCand: CandidateGraph =
-            tail
-              .map { case (a, ps) =>
-                val newPS =
-                  ps.map { case (pr, subs) =>
-                    (pr, subs.filterNot { case (_, ap) => finished(ap) })
-                  }
-                (a, newPS)
-              }
+            val finished: Set[AP] = subs.map(_._2).toSet
+            // this ArtifactOrProject has been used, so nothing in rest is legitimate
+            // but we also need to filter to not consider items we have already added
+            val newCand: CandidateGraph =
+              tail
+                .map { case (a, ps) =>
+                  val newPS =
+                    ps.map { case (pr, subs) =>
+                      (pr, subs.filterNot { case (_, ap) => finished(ap) })
+                    }
+                  (a, newPS)
+                }
 
-          // this AP can't appear in others:
-          val case1 = manyWorlds(newCand, acc.add(art, newPR))
+            // this AP can't appear in others:
+            val newAcc = acc.add(art, newPR)
+            val case1: Option[Entries] =
+              Entries.pickBetter(best, manyWorlds(newCand, newAcc, best))
 
-          // If we can still skip this (pr, subs) item and still
-          // find homes for all the AP pairs in subs, then try
-          def maybeRecurse(g: CandidateGraph): List[Entries] = {
-            val aps = subs.iterator.map(_._2)
-            val stillPaths = aps.filterNot(apsIn(g)).isEmpty
-            if (stillPaths) manyWorlds(g, acc)
-            else Nil
-          }
+            // If we can still skip this (pr, subs) item and still
+            // find homes for all the AP pairs in subs, then try
+            def maybeRecurse(g: CandidateGraph, currentBest: Option[Entries]): Option[Entries] = {
+              val aps = subs.iterator.map(_._2)
+              val stillPaths = aps.filterNot(apsIn(g)).isEmpty
+              if (stillPaths) Entries.pickBetter(currentBest, manyWorlds(g, acc, currentBest))
+              else currentBest
+            }
 
-          // or we could have not used this (art, pr) pair at all if there is
-          // something else to use it in rest:
-          // if any APs in subs don't appear in the rest this can't be successful
-          // check that before we recurse
-          val case2 = maybeRecurse((art, rest) :: tail)
+            // or we could have not used this (art, pr) pair at all if there is
+            // something else to use it in rest:
+            // if any APs in subs don't appear in the rest this can't be successful
+            // check that before we recurse
+            val case2: Option[Entries] = maybeRecurse((art, rest) :: tail, case1)
 
-          // or we could have just skipped using this art entirely
-          // so that we don't exclude APs associated with it from
-          // better matches
-          // if any APs in subs don't appear in the rest this can't be successful
-          // check that before we recurse
-          val case3 = maybeRecurse(tail)
+            // or we could have just skipped using this art entirely
+            // so that we don't exclude APs associated with it from
+            // better matches
+            // if any APs in subs don't appear in the rest this can't be successful
+            // check that before we recurse
+            val case3: Option[Entries] = maybeRecurse(tail, case2)
 
-          case1 reverse_::: case2 reverse_::: case3
+            case3
+        }
       }
     }
 
     def select(cs: CandidateGraph, inputs: Set[AP]): List[AP] = {
       // We want the result that has all inputs and is smallest
-      manyWorlds(cs, Entries.empty) match {
-        case Nil => Nil
-        case nonEmpty =>
-          nonEmpty
-            .filter(_.hasAll(inputs))
-            .groupBy(_.length)
-            .toList
-            .minBy(_._1)
-            ._2
-            .map(_.normalized)
-            .min
-            .values
-      }
+      manyWorlds(cs, Entries.empty(inputs), None).toList.flatMap(_.values)
     }
     // Each artifact or project has a minimal prefix
     // they can't conflict if that minimal prefix does not conflict
