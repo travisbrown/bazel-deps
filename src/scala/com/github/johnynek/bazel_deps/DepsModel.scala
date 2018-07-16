@@ -791,6 +791,57 @@ case class Dependencies(toMap: Map[MavenGroup, Map[ArtifactOrProject, ProjectRec
 object Dependencies {
   def empty: Dependencies = Dependencies(Map.empty[MavenGroup, Map[ArtifactOrProject, ProjectRecord]])
 
+  case class Entries(values: List[(ArtifactOrProject, ProjectRecord)]) {
+    private lazy val flattened: Set[(ArtifactOrProject, ProjectRecord)] = values.flatMap {
+      case (a, p) => p.flatten(a)
+    }.toSet
+
+    lazy val length: Int = values.length
+
+    def hasAll(inputs: Set[(ArtifactOrProject, ProjectRecord)]): Boolean =
+      flattened == inputs
+
+    def add(a: ArtifactOrProject, p: ProjectRecord): Entries =
+      Entries((a, p) :: values)
+
+    def normalized: Entries = Entries(values.sorted(Entries.orderEntry))
+  }
+
+  object Entries {
+    val empty: Entries = Entries(Nil)
+
+    private implicit def orderList[T: Ordering]: Ordering[List[T]] =
+      Ordering.Iterable[T].on[List[T]](identity)
+
+    private implicit val orderArtifactOrProject: Ordering[ArtifactOrProject] =
+      Ordering.by { a: ArtifactOrProject =>
+        val str = a.asString
+        (-str.size, str)
+      }
+
+    val orderEntry: Ordering[(ArtifactOrProject, ProjectRecord)] =
+      Ordering[(ProjectRecord, ArtifactOrProject)].on(_.swap)
+
+    /**
+     * Order by descending preference.
+     *
+     * We prefer shorter entries, and when two entries have the same length, we
+     * next compare the collections lexicographically by length and value of
+     * prefix (first preferring longer prefixes, then the lexicographically
+     * earlier string).
+     */
+    implicit val orderEntries: Ordering[Entries] = new Ordering[Entries] {
+      private val sameLength: Ordering[List[(ArtifactOrProject, ProjectRecord)]] =
+        Ordering[List[(ArtifactOrProject, ProjectRecord)]]
+
+      def compare(as: Entries, bs: Entries): Int = {
+        val diff = as.length - bs.length
+
+        if (diff != 0) diff else sameLength.compare(as.values, bs.values)
+      }
+    }
+  }
+
   /**
    * Combine as many ProjectRecords as possible into a result
    */
@@ -813,7 +864,7 @@ object Dependencies {
 
     // each Artifact-project record pair is either in the final result, or it isn't. We
     // just build all the cases now:
-    def manyWorlds(candidates: CandidateGraph, acc: List[AP]): List[List[AP]] = {
+    def manyWorlds(candidates: CandidateGraph, acc: Entries): List[Entries] = {
       candidates match {
         case Nil => List(acc)
         case (art, Nil) :: tail => manyWorlds(tail, acc)
@@ -822,10 +873,10 @@ object Dependencies {
           // we consider taking (art, pr) and putting it in the result:
           val newPR = subs.foldLeft(pr) { case (pr, (sub, _)) => pr.withModule(sub) }.normalizeEmptyModule
 
-          val finished = subs.map(_._2).toSet
+          val finished: Set[AP] = subs.map(_._2).toSet
           // this ArtifactOrProject has been used, so nothing in rest is legitimate
           // but we also need to filter to not consider items we have already added
-          val newCand =
+          val newCand: CandidateGraph =
             tail
               .map { case (a, ps) =>
                 val newPS =
@@ -836,11 +887,11 @@ object Dependencies {
               }
 
           // this AP can't appear in others:
-          val case1 = manyWorlds(newCand, (art, newPR) :: acc)
+          val case1 = manyWorlds(newCand, acc.add(art, newPR))
 
           // If we can still skip this (pr, subs) item and still
           // find homes for all the AP pairs in subs, then try
-          def maybeRecurse(g: CandidateGraph): List[List[AP]] = {
+          def maybeRecurse(g: CandidateGraph): List[Entries] = {
             val aps = subs.iterator.map(_._2)
             val stillPaths = aps.filterNot(apsIn(g)).isEmpty
             if (stillPaths) manyWorlds(g, acc)
@@ -865,32 +916,19 @@ object Dependencies {
     }
 
     def select(cs: CandidateGraph, inputs: Set[AP]): List[AP] = {
-      def hasAllInputs(lp: List[AP]): Boolean =
-        inputs == flatten(lp).toSet
-
       // We want the result that has all inputs and is smallest
-      manyWorlds(cs, Nil) match {
+      manyWorlds(cs, Entries.empty) match {
         case Nil => Nil
         case nonEmpty =>
-          val minimal = nonEmpty
-            .filter(hasAllInputs _)
-            .groupBy(_.size) // there can be several variants with the same count
+          nonEmpty
+            .filter(_.hasAll(inputs))
+            .groupBy(_.length)
             .toList
             .minBy(_._1)
             ._2
-          // after first taking the minimal number, we want
-          // the lowest versions first, then we want the longest
-          // prefixes
-          implicit def ordList[T: Ordering]: Ordering[List[T]] =
-            Ordering.Iterable[T].on[List[T]] { l => l }
-
-          implicit val orderingArtP: Ordering[ArtifactOrProject] =
-            Ordering.by { a: ArtifactOrProject =>
-              val str = a.asString
-              (-str.size, str)
-            }
-          // max of the sorted list gets us the longest strings, from last to front.
-          minimal.map(_.sortBy(_.swap)).min
+            .map(_.normalized)
+            .min
+            .values
       }
     }
     // Each artifact or project has a minimal prefix
