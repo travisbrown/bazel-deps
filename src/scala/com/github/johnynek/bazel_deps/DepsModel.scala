@@ -908,9 +908,11 @@ object Dependencies {
         // in the artifact name, which looked nice, but resulted in terrible
         // runtime performance (literally hours to format the file) in cases
         // with lots of subprojects. The `take(2)` here restricts the split to
-        // happening at the first hyphen (if at all).
-        val subs = a.splitSubprojects1.toList.take(2)
-        val prefix = subs.map { case (ArtifactOrProject(MavenArtifactId(artifact, _, _)), _) => artifact }.min
+        // happening at the last two hyphen (if at all).
+        val subs = a.splitSubprojects1.toList.sortBy {
+          case (ArtifactOrProject(MavenArtifactId(artifact, _, _)), _) => artifact
+        }.takeRight(2)
+        val prefix = subs.head._1.artifact.artifactId
         subs.map { case (a, sp) =>
           (prefix, (a, (p, (sp, ap))))
         }
