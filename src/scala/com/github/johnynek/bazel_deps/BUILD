@@ -157,4 +157,3 @@ scala_library(name = "decoders",
                   "//3rdparty/jvm/io/circe:circe_generic",
               ],
               visibility = ["//visibility:public"])
-

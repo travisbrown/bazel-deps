@@ -795,10 +795,136 @@ case class Dependencies(toMap: Map[MavenGroup, Map[ArtifactOrProject, ProjectRec
 object Dependencies {
   def empty: Dependencies = Dependencies(Map.empty[MavenGroup, Map[ArtifactOrProject, ProjectRecord]])
 
+  case class ArtifactTree(
+    label: String,
+    value: Option[MavenArtifactId],
+    children: List[ArtifactTree]
+  ) {
+    def insert(path: NonEmptyList[String], artifact: MavenArtifactId): ArtifactTree = copy(
+      children = children.indexWhere(_.label == path.head) match {
+        case -1 =>
+          children :+ (
+            path match {
+              case NonEmptyList(h, Nil) => ArtifactTree(h, Some(artifact), Nil)
+              case NonEmptyList(h, t1 :: t2) =>
+                ArtifactTree(h, None, Nil).insert(NonEmptyList(t1, t2), artifact)
+            }
+          )
+        case index =>
+          children.updated(
+            index,
+            path.tail match {
+              case Nil => children(index).copy(value = Some(artifact))
+              case h :: t =>
+                children(index).insert(NonEmptyList(h, t), artifact)
+            }
+          )
+      }
+    )
+
+    private def commonPrefix[A](s: Seq[A], t: Seq[A]): Seq[A] = {
+      val maxSize = scala.math.min(s.size, t.size)
+      var i: Int = 0
+      while (i < maxSize && s(i) == t(i)) i += 1
+      s.take(i)
+    }
+
+    private def commonPrefix[A](strings: NonEmptyList[Seq[A]]): Seq[A] =
+      strings.tail.foldLeft(strings.head) {
+        case (acc, s) => commonPrefix(acc, s)
+      }
+
+    def merge(artifacts: NonEmptyList[MavenArtifactId]): (MavenArtifactId, Set[Subproject]) = {
+      val parts = artifacts.map(_.artifactId.split("-").toList)
+      val prefix = commonPrefix(parts)
+
+      (
+        artifacts.head.copy(artifactId = prefix.mkString("-")),
+        parts.map(_.drop(prefix.size).mkString("-")).map(Subproject(_)).toList.toSet
+      )
+    }
+
+    def flatten: Either[MavenArtifactId, List[(MavenArtifactId, Set[Subproject])]] = {
+      val flattenedChildren = children.map(_.flatten)
+
+      val singletons: List[MavenArtifactId] = value.toList ++ flattenedChildren.collect {
+        case Left(artifact) => artifact
+      }
+
+      val done: List[(MavenArtifactId, Set[Subproject])] = flattenedChildren.flatMap {
+        case Left(_) => Nil
+        case Right(values) => values
+      }
+
+      (singletons, done) match {
+        case (h :: Nil, Nil) => Left(h)
+        case (Nil, values) => Right(values)
+        case (h :: t, values) => Right(merge(NonEmptyList(h, t)) :: values)
+      }
+    }
+  }
+
+  case class ArtifactForest(trees: List[ArtifactTree]) {
+    def insert(artifact: MavenArtifactId): ArtifactForest = {
+      val parts = artifact.artifactId.split("-").toList
+      val partsTail = parts.tail match {
+        case Nil => NonEmptyList.of("")
+        case h :: t => NonEmptyList(h, t)
+      }
+
+      copy(
+        trees = trees.indexWhere(_.label == parts.head) match {
+          case -1 =>
+            trees :+ ArtifactTree(parts.head, None, Nil).insert(partsTail, artifact)
+          case index => trees.updated(index, trees(index).insert(partsTail, artifact))
+        }
+      )
+    }
+  }
+
+  object ArtifactForest {
+    def fromArtifacts(artifacts: List[MavenArtifactId]): ArtifactForest =
+      artifacts.foldLeft(ArtifactForest(Nil)) {
+        case (acc, artifact) => acc.insert(artifact)
+      }
+  }
+
+  def normalize(entries: List[(ArtifactOrProject, ProjectRecord)]): List[(ArtifactOrProject, ProjectRecord)] = {
+    val expanded: List[(MavenArtifactId, ProjectRecord)] = entries.flatMap {
+      case (ap, pr) =>pr.modules match {
+        case Some(modules) =>
+          val newPr = pr.copy(modules = None)
+
+          modules.map(subproject => (ap.toArtifact(subproject).artifact, newPr))
+        case None => List((ap.artifact, pr))
+      }
+    }
+
+    val byProjectRecord: Map[ProjectRecord, List[MavenArtifactId]] =
+      expanded.groupBy(_._2).mapValues(_.map(_._1))
+
+    byProjectRecord.toList.flatMap {
+      case (pr, artifacts) =>
+        val forest = ArtifactForest.fromArtifacts(artifacts)
+        println(s"==========\n$forest")
+
+        val res = forest.trees.map(_.flatten).flatMap {
+          case Left(artifact) => List((ArtifactOrProject(artifact), pr))
+          case Right(withSubprojects) => withSubprojects.map {
+            case (artifact, subprojects) => (ArtifactOrProject(artifact), pr.copy(modules = Some(subprojects)))
+          }
+        }
+
+        res.map {
+          case (ap, pr) => (ap, pr.normalizeEmptyModule)
+        }
+    }
+  }
+
   /**
    * Combine as many ProjectRecords as possible into a result
    */
-  def normalize(candidates0: List[(ArtifactOrProject, ProjectRecord)]): List[(ArtifactOrProject, ProjectRecord)] = {
+  def normalize_(candidates0: List[(ArtifactOrProject, ProjectRecord)]): List[(ArtifactOrProject, ProjectRecord)] = {
     type AP = (ArtifactOrProject, ProjectRecord)
 
     def group[A, B](abs: List[(A, B)]): List[(A, List[B])] =
